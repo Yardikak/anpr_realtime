@@ -4,7 +4,7 @@ import time
 import threading # Impor modul threading
 import queue     # Impor modul queue untuk komunikasi antar thread
 from imutils.video import VideoStream # Still imported, but not used if cv2.VideoCapture is used for file
-from ultralytics import YOLO
+from ultralytics import YOLO # Impor YOLO dari ultralytics
 import easyocr
 import os
 import re # Impor modul regex untuk validasi plat nomor
@@ -58,6 +58,16 @@ OCR_CORRECTION_MAP = {
 # Simulasi database plat nomor terdaftar. Dalam aplikasi nyata, ini akan terhubung ke database.
 REGISTERED_PLATES = ["B1234ABC", "D5678XYZ", "F9012UVW"]
 LOG_FILE_PATH = "anpr_log.txt" # Path untuk file log
+
+# --- Konfigurasi untuk Pengambilan Gambar (Screenshot) ---
+SAVE_IMAGE_FPS = 2 # Target FPS untuk penyimpanan gambar
+SAVE_IMAGE_DIR = "captured_frames" # Direktori untuk menyimpan gambar
+
+# Pastikan direktori penyimpanan gambar ada
+if not os.path.exists(SAVE_IMAGE_DIR):
+    os.makedirs(SAVE_IMAGE_DIR)
+    print(f"[INFO] Direktori '{SAVE_IMAGE_DIR}' dibuat untuk menyimpan gambar.")
+
 
 # --- Vehicle Detection Function with YOLOv8 ---
 
@@ -424,6 +434,10 @@ def main():
 
     fps_start_time = time.time()
     fps_frame_count = 0
+    
+    # Inisialisasi timer untuk penyimpanan gambar
+    last_save_time = time.time()
+    save_interval = 1.0 / SAVE_IMAGE_FPS # Interval waktu per frame untuk penyimpanan
 
     try:
         while not stop_event.is_set():
@@ -443,6 +457,16 @@ def main():
                 cv2.putText(frame_to_display, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 fps_frame_count = 0
                 fps_start_time = time.time()
+
+            # --- Penyimpanan Gambar (Screenshot) pada FPS Tertentu ---
+            current_time = time.time()
+            if current_time - last_save_time >= save_interval:
+                timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] # Timestamp dengan milidetik
+                image_filename = os.path.join(SAVE_IMAGE_DIR, f"frame_{timestamp_str}.jpg")
+                cv2.imwrite(image_filename, frame_to_display)
+                print(f"[INFO] Gambar disimpan: {image_filename}")
+                last_save_time = current_time
+            # --- Akhir Penyimpanan Gambar ---
 
             # Task 6.3: Penyimpanan/Tampilan - Tampilkan hasil real-time (Video Output)
             # Display frame
