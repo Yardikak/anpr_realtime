@@ -1,0 +1,17 @@
+# Pustaka utama yang dibutuhkan untuk sistem ANPR
+opencv-python
+numpy
+imutils
+easyocr
+ultralytics
+
+# Pustaka opsional (jika Anda berencana menggunakannya di masa mendatang atau untuk tujuan lain)
+# tensorflow
+# keras
+
+# PyTorch membutuhkan URL indeks khusus untuk dukungan
+# CPU dan CUDA. Pilih salah satu sesuai kebutuhan Anda.
+# Untuk CPU:
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Untuk CUDA 12.1 (ganti dengan versi yang sesuai jika perlu):
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
