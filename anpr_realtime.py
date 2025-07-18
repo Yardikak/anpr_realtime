@@ -1,81 +1,96 @@
 import cv2
 import numpy as np
 import time
-import threading # Impor modul threading
-import queue     # Impor modul queue untuk komunikasi antar thread
-from imutils.video import VideoStream # Still imported, but not used if cv2.VideoCapture is used for file
-from ultralytics import YOLO # Impor YOLO dari ultralytics
-import easyocr
+import threading 
+import queue
+from imutils.video import VideoStream
+from ultralytics import YOLO 
+import easyocr 
 import os
-import re # Impor modul regex untuk validasi plat nomor
-import torch # Impor torch untuk memindahkan model YOLO ke GPU
-import datetime # Impor modul datetime untuk timestamp logging
-import csv       # Impor modul csv untuk menyimpan data ke CSV
+import re 
+import torch 
+import datetime 
+import csv        
 
 # --- Konfigurasi dan Pemuatan Model ---
 
-# Path ke model YOLOv8.
-# Ultralytics akan mengunduh model ini secara otomatis jika belum ada.
-# Pilih versi yang sesuai: 'yolov8n.pt' (nano, fastest), 'yolov8s.pt' (small), 'yolov8m.pt' (medium)
-PATH_TO_YOLOV8_MODEL = 'yolov8n.pt'
+PATH_TO_YOLOV8_MODEL = 'yolov8n.pt' # Model YOLOv8 pre-trained untuk deteksi kendaraan
 
-# Inisialisasi EasyOCR reader
 print("[INFO] Memuat model EasyOCR (mungkin butuh waktu pertama kali)...")
-# EasyOCR secara default akan mencoba menggunakan GPU jika tersedia
-reader = easyocr.Reader(['en']) # 'en' for Latin characters on license plates
+# Inisialisasi EasyOCR reader. Menggunakan GPU jika tersedia.
+# 'en' untuk karakter Latin pada plat nomor.
+reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available()) 
 print("[INFO] EasyOCR model loaded successfully.")
 
-# Load the YOLOv8 model
 print(f"[INFO] Memuat model deteksi objek YOLOv8 dari {PATH_TO_YOLOV8_MODEL}...")
 yolo_model = YOLO(PATH_TO_YOLOV8_MODEL)
 
-# OPTIMASI 1: Memastikan Pemanfaatan GPU Maksimal untuk YOLOv8
-# Pindahkan model YOLOv8 ke GPU jika tersedia
+# Memastikan pemanfaatan GPU maksimal untuk YOLOv8 jika tersedia.
 if torch.cuda.is_available():
     yolo_model.to('cuda')
     print("[INFO] YOLOv8 model dipindahkan ke GPU.")
 else:
-    print("[INFO] GPU tidak tersedia, YOLOv8 akan berjalan di CPU.")
+    print("[INFO] GPU tidak tersedia, YOLOv8 akan berjalan di CPU. Performa mungkin lebih lambat.")
 print("[INFO] YOLOv8 model berhasil dimuat.")
 
-
-# Define object classes to be detected as 'vehicles' from the COCO dataset
-# These class IDs are standard for the COCO dataset:
-# 2: car, 3: motorcycle, 5: bus, 7: truck
+# Definisikan kelas objek yang akan dideteksi sebagai 'kendaraan' dari dataset COCO.
+# ID kelas ini adalah standar untuk dataset COCO:
+# 2: car (mobil), 3: motorcycle (motor), 5: bus, 7: truck (truk)
 VEHICLE_CLASSES_IDS = [2, 3, 5, 7]
 
-# OPTIMASI 5: Post-processing dan Validasi Plat Nomor yang Lebih Kuat
-# Regex untuk format plat nomor Indonesia (contoh sederhana: AA 1234 BBB)
-# Ini bisa disesuaikan lebih lanjut untuk mencakup semua variasi
-# Contoh: [A-Z]{1,2} (1 atau 2 huruf awal), \s? (spasi opsional), \d{1,4} (1-4 angka), \s? (spasi opsional), [A-Z]{1,3} (1-3 huruf akhir)
-INDONESIAN_PLATE_REGEX = r"^[A-Z]{1,2}\s?\d{1,4}\s?[A-Z]{1,3}$"
+# --- Post-processing dan Validasi Plat Nomor yang Lebih Kuat ---
+# Regex untuk format plat nomor Indonesia.
+# INDONESIAN_PLATE_REGEX: Lebih akurat untuk plat Indonesia standar (1 atau 2 huruf di awal).
+# ^[A-Z]{1,2}\s?\d{1,4}\s?[A-Z]{0,3}$
+#   - ^[A-Z]{1,2}: 1 atau 2 huruf di awal (contoh: B, AB)
+#   - \s?: Spasi opsional
+#   - \d{1,4}: 1 sampai 4 digit angka
+#   - \s?: Spasi opsional
+#   - [A-Z]{0,3}$: 0 sampai 3 huruf di akhir (contoh: ABC, A, atau kosong)
+INDONESIAN_PLATE_REGEX = r"^[A-Z]{1,2}\s?\d{1,4}\s?[A-Z]{0,3}$"
 
-# Mapping untuk koreksi kesalahan OCR umum (O vs 0, I vs 1, dll.)
+# INDONESIAN_PLATE_REGEX_FLEXIBLE: Regex yang lebih fleksibel untuk mengantisipasi OCR yang 
+# sering menghilangkan spasi atau salah mengenali jumlah huruf awal/akhir karena noise.
+# Memungkinkan 1 hingga 3 huruf di awal dan tanpa spasi.
+INDONESIAN_PLATE_REGEX_FLEXIBLE = r"^[A-Z]{1,3}\d{1,4}[A-Z]{0,3}$" 
+
+# Set True untuk mengaktifkan validasi regex. Disarankan True untuk produksi.
+# Untuk debugging awal jika CSV kosong, set ke False untuk melihat semua deteksi teks.
+ENABLE_PLATE_REGEX_VALIDATION = True 
+
+# Mapping untuk koreksi kesalahan OCR umum.
+# OCR sering salah mengenali karakter yang mirip visualnya (misal O vs 0).
+# Tambahkan mapping berdasarkan kesalahan yang sering Anda temukan pada hasil OCR.
 OCR_CORRECTION_MAP = {
-    'O': '0', 'I': '1', 'L': '1', 'S': '5', 'B': '8', 'Z': '2'
+    'O': '0', 'I': '1', 'L': '1', 'S': '5', 'B': '8', 'Z': '2',
+    'G': '6', 'Q': '0', 'D': '0', 'A': '4', 'J': '1', 'U': '0', 'V': 'Y', 'K': 'X',
+    'F': 'E', 'P': 'R', 
+    ' ': '', # Opsional: Hapus spasi yang mungkin dikenali OCR di tengah plat setelah pembersihan alfanumerik.
+             # Ini akan diterapkan di `cleaned_text = cleaned_text.replace(original, corrected)`.
 }
 
-# --- Task 6: Validasi dan Format Keluaran - Basis Data (Simulasi) ---
-# Simulasi database plat nomor terdaftar. Dalam aplikasi nyata, ini akan terhubung ke database.
-REGISTERED_PLATES = ["B1234ABC", "D5678XYZ", "F9012UVW"]
-LOG_FILE_PATH = "anpr_log.txt" # Path untuk file log
+# --- Validasi dan Format Keluaran - Basis Data (Simulasi) ---
+# Simulasi database plat nomor terdaftar.
+# Dalam aplikasi nyata, ini akan terhubung ke database eksternal (misal: MySQL, PostgreSQL).
+REGISTERED_PLATES = ["BDB4668", "BOK5EI", "B98ED2", "B45261D", "A8245S", "AR606L", "AE670S", "AE67OS", "APHI88", "A3K961", "A968B6", "AV619Q", "AV619O"]
+LOG_FILE_PATH = "anpr_log.txt" # Path untuk file log tekstual
 CSV_LOG_FILE_PATH = "anpr_detections.csv" # Path untuk file log CSV
 
-# --- Konfigurasi untuk Pengambilan Gambar (Screenshot) ---
-SAVE_IMAGE_ROOT_DIR = "anpr_output" # Direktori root untuk semua output
+# --- Konfigurasi untuk Penyimpanan Gambar (Output) ---
+SAVE_IMAGE_ROOT_DIR = "anpr_output" 
 FULL_FRAMES_WITH_DETECTIONS_DIR = os.path.join(SAVE_IMAGE_ROOT_DIR, "full_frames_with_detections")
 CROPPED_VEHICLE_IMAGES_DIR = os.path.join(SAVE_IMAGE_ROOT_DIR, "cropped_vehicle_images")
 PROCESSED_LICENSE_PLATE_IMAGES_DIR = os.path.join(SAVE_IMAGE_ROOT_DIR, "processed_license_plate_images")
-DEBUG_PLATE_IMAGES_DIR = os.path.join(SAVE_IMAGE_ROOT_DIR, "debug_plate_images") # Direktori untuk debug
+DEBUG_PLATE_IMAGES_DIR = os.path.join(SAVE_IMAGE_ROOT_DIR, "debug_plate_images") # Direktori untuk debug gambar pra-pemrosesan plat
 
-# Pastikan direktori penyimpanan gambar ada
+# Pastikan semua direktori output ada. Buat jika belum ada.
 os.makedirs(FULL_FRAMES_WITH_DETECTIONS_DIR, exist_ok=True)
 os.makedirs(CROPPED_VEHICLE_IMAGES_DIR, exist_ok=True)
 os.makedirs(PROCESSED_LICENSE_PLATE_IMAGES_DIR, exist_ok=True)
-os.makedirs(DEBUG_PLATE_IMAGES_DIR, exist_ok=True) # Buat direktori debug
+os.makedirs(DEBUG_PLATE_IMAGES_DIR, exist_ok=True) 
 print(f"[INFO] Direktori output dibuat: '{SAVE_IMAGE_ROOT_DIR}' dengan sub-direktori.")
 
-# Fungsi untuk menulis header CSV jika file belum ada
+# Fungsi untuk menulis header CSV jika file belum ada.
 def write_csv_header():
     if not os.path.exists(CSV_LOG_FILE_PATH):
         with open(CSV_LOG_FILE_PATH, mode='w', newline='') as file:
@@ -83,522 +98,410 @@ def write_csv_header():
             writer.writerow(['Timestamp', 'Plate_Text', 'Status', 'Confidence', 'Full_Frame_Path', 'Cropped_Vehicle_Path', 'Processed_Plate_Path'])
         print(f"[INFO] Header CSV ditulis ke '{CSV_LOG_FILE_PATH}'")
 
-# Panggil fungsi untuk menulis header saat startup
 write_csv_header()
 
-# --- Vehicle Detection Function with YOLOv8 ---
-
+# --- Fungsi Deteksi Kendaraan dengan YOLOv8 ---
 def detect_vehicles(frame, model, confidence_threshold=0.5):
     """
-    Detects vehicles in a frame using YOLOv8.
-    YOLOv8 internally performs pre-processing such as resizing.
+    Mendeteksi kendaraan dalam sebuah frame menggunakan YOLOv8.
+    Args:
+        frame (np.array): Gambar frame input (BGR).
+        model (YOLO model): Model YOLOv8 yang sudah dimuat.
+        confidence_threshold (float): Ambang batas kepercayaan untuk deteksi objek.
+    Returns:
+        list: Daftar kamus yang berisi info kendaraan terdeteksi 
+              (box, label, confidence, cropped_image, cropped_image_path).
     """
-    # Perform inference with the YOLOv8 model
-    # conf: confidence threshold for detection. Meningkatkan ini akan mengurangi deteksi lemah.
     results = model(frame, conf=confidence_threshold, verbose=False)
 
     detected_vehicles = []
     for r in results:
         boxes = r.boxes
         for box in boxes:
-            cls = int(box.cls[0]) # Class ID
-            conf = float(box.conf[0]) # Confidence score
+            cls = int(box.cls[0]) 
+            conf = float(box.conf[0]) 
 
-            if cls in VEHICLE_CLASSES_IDS: # Check if it's a vehicle class we want
-                x1, y1, x2, y2 = map(int, box.xyxy[0]) # Bounding box coordinates (x_min, y_min, x_max, y_max)
+            if cls in VEHICLE_CLASSES_IDS: 
+                x1, y1, x2, y2 = map(int, box.xyxy[0]) 
                 w = x2 - x1
                 h = y2 - y1
-                label = model.names[cls] # Class name (e.g., 'car', 'truck')
+                label = model.names[cls] 
 
-                # Cropped vehicle image (high quality, no background)
-                # Ensure coordinates are within frame bounds
+                cropped_vehicle_image = None
+                cropped_vehicle_file_path = "" # Inisialisasi path
                 x1_crop = max(0, x1)
                 y1_crop = max(0, y1)
                 x2_crop = min(frame.shape[1], x2)
                 y2_crop = min(frame.shape[0], y2)
-                # Pastikan crop tidak menghasilkan gambar kosong
+                
                 if x2_crop > x1_crop and y2_crop > y1_crop:
                     cropped_vehicle_image = frame[y1_crop:y2_crop, x1_crop:x2_crop].copy()
-                else:
-                    cropped_vehicle_image = None # Jika crop tidak valid
-
+                    ts_vehicle = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    # Nama file unik per kendaraan per frame dengan koordinat awal
+                    cropped_vehicle_file_path = os.path.join(CROPPED_VEHICLE_IMAGES_DIR, f"vehicle_{label}_{ts_vehicle}_{x1_crop}-{y1_crop}.jpg")
+                    cv2.imwrite(cropped_vehicle_file_path, cropped_vehicle_image)
+                    # print(f"[INFO] Gambar kendaraan di-crop disimpan: {cropped_vehicle_file_path}") # Matikan untuk mengurangi log spam
+                
                 detected_vehicles.append({
-                    'box': (x1, y1, w, h), # Format (x, y, width, height)
+                    'box': (x1, y1, w, h), 
                     'label': label,
                     'confidence': conf,
-                    'cropped_image': cropped_vehicle_image # Tambahkan gambar kendaraan yang di-crop
+                    'cropped_image': cropped_vehicle_image,
+                    'cropped_image_path': cropped_vehicle_file_path # Menyimpan path gambar yang di-crop
                 })
     return detected_vehicles
 
-# --- Task 4: Normalisasi dan Segmentasi Karakter ---
-# Fungsi ini akan mengintegrasikan langkah-langkah normalisasi dan segmentasi
-# untuk area plat nomor yang terdeteksi sebelum diberikan ke OCR.
-
+# --- Normalisasi dan Segmentasi Karakter ---
 def deskew_plate(image):
     """
-    Melakukan deskewing (koreksi kemiringan) pada gambar plat nomor.
-    Ini adalah implementasi sederhana dan mungkin perlu disempurnakan
-    untuk performa dan akurasi yang lebih baik.
+    Melakukan koreksi kemiringan (deskewing) pada gambar plat nomor.
     """
-    # Pastikan gambar adalah grayscale
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image
-
-    # Thresholding untuk mendapatkan citra biner
-    # Menggunakan THRESH_BINARY_INV untuk karakter gelap di latar belakang terang
     thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
-    # Temukan kontur
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Cari kontur terbesar (diasumsikan sebagai plat nomor)
     if not contours:
-        return image # Return original if no contours found
-    
+        return image
     largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Dapatkan bounding box berputar
     rect = cv2.minAreaRect(largest_contour)
     angle = rect[2]
-
-    # Jika sudut terlalu besar, sesuaikan
-    # Sudut dari minAreaRect berada dalam rentang [-90, 0)
-    # Kita ingin mengoreksi agar teks menjadi horizontal.
     if angle < -45:
         angle = -(90 + angle)
     else:
         angle = -angle
-
-    # Dapatkan matriks rotasi
     (h, w) = image.shape[:2]
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    
-    # Lakukan rotasi
     rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return rotated
 
-def detect_and_recognize_license_plates(frame, vehicle_boxes, reader):
+def detect_and_recognize_license_plates(full_frame, detected_vehicles_info, reader):
     """
-    Detects and recognizes license plates within detected vehicle areas,
-    or from the entire frame if no vehicles are detected.
-    Uses EasyOCR for text detection and recognition.
+    Mendeteksi dan mengenali plat nomor dari gambar kendaraan yang sudah dipotong.
+    Menggunakan EasyOCR untuk deteksi dan pengenalan teks, serta pra-pemrosesan gambar.
     """
-    detected_plates_info = []
+    detected_plates_info_list = []
 
-    search_areas = []
-    if vehicle_boxes:
-        for vehicle in vehicle_boxes:
-            x, y, w, h = vehicle['box']
-            # Ciri-ciri Plat Nomor: Rasio Aspek & Lokasi Heuristik
-            # Persempit area pencarian plat nomor ke bagian bawah kendaraan
-            plate_search_x = max(0, x)
-            plate_search_y = max(0, y + int(h * 0.5)) # Start from the middle downwards
-            plate_search_w = min(w, frame.shape[1] - plate_search_x)
-            plate_search_h = min(int(h * 0.5), frame.shape[0] - plate_search_y) # Bottom half
+    for vehicle_info in detected_vehicles_info:
+        cropped_vehicle_image = vehicle_info['cropped_image']
+        vehicle_offset_x = vehicle_info['box'][0]
+        vehicle_offset_y = vehicle_info['box'][1]
 
-            if plate_search_w > 0 and plate_search_h > 0:
-                search_areas.append((frame[plate_search_y : plate_search_y + plate_search_h,
-                                            plate_search_x : plate_search_x + plate_search_w],
-                                     plate_search_x, plate_search_y))
-
-    # Fallback: if no vehicles are detected, or the area within the vehicle is empty,
-    # try searching the entire frame (less efficient but can catch missed plates)
-    if not search_areas:
-        search_areas.append((frame, 0, 0)) # Entire frame with 0,0 offset
-
-    for area_img, offset_x, offset_y in search_areas:
-        if area_img.shape[0] == 0 or area_img.shape[1] == 0:
+        if cropped_vehicle_image is None or cropped_vehicle_image.shape[0] == 0 or cropped_vehicle_image.shape[1] == 0:
             continue
 
-        # --- Task 4: Normalisasi dan Segmentasi Karakter ---
-        # Ini adalah bagian penting untuk menonjolkan ciri-ciri plat nomor (tekstur, kontur, warna kontras)
-        # dan mempersiapkannya untuk pengenalan karakter yang akurat.
-        # Eksperimen dengan langkah-langkah ini untuk menyeimbangkan kecepatan dan akurasi.
-        # Setiap langkah menambah beban komputasi.
-        processed_area = area_img.copy()
+        # Persempit area pencarian plat nomor ke bagian bawah kendaraan yang sudah di-crop.
+        # Proporsi 0.5 (setengah bagian bawah) adalah heuristik awal.
+        # Anda bisa menyesuaikan `plate_search_y_relative` atau `plate_search_h_relative`
+        # jika plat nomor di video Anda cenderung berada di posisi lain (misal lebih tinggi, lebih rendah).
+        plate_search_x_relative = 0
+        plate_search_y_relative = int(cropped_vehicle_image.shape[0] * 0.5) 
+        plate_search_w_relative = cropped_vehicle_image.shape[1]
+        plate_search_h_relative = int(cropped_vehicle_image.shape[0] * 0.5) 
+
+        if plate_search_w_relative <= 0 or plate_search_h_relative <= 0:
+            continue
+
+        area_img_for_plate = cropped_vehicle_image[plate_search_y_relative : plate_search_y_relative + plate_search_h_relative,
+                                                     plate_search_x_relative : plate_search_x_relative + plate_search_w_relative]
+
+        if area_img_for_plate.shape[0] == 0 or area_img_for_plate.shape[1] == 0:
+            continue
+
+        processed_area_original = area_img_for_plate.copy() 
+
+        processed_area_deskewed = deskew_plate(processed_area_original)
+        processed_area_grayscale = cv2.cvtColor(processed_area_deskewed, cv2.COLOR_BGR2GRAY)
         
-        # Task 4.1: Koreksi Perspektif (Deskewing)
-        # Meluruskan plat nomor yang miring. Sangat penting untuk akurasi OCR.
-        processed_area = deskew_plate(processed_area)
+        # PENYESUAIAN CLAHE: Tingkatkan clipLimit untuk kontras lebih kuat di kondisi malam atau pencahayaan tidak merata.
+        # tileGridSize (8,8) adalah umum.
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8)) # DISESUAIKAN: clipLimit dari 2.0 ke 4.0
+        processed_area_clahe = clahe.apply(processed_area_grayscale)
 
-        # Task 4.2: Peningkatan Kontras / Konversi Grayscale
-        # Konversi Grayscale: Seringkali membantu untuk OCR karena mengurangi dimensi warna.
-        processed_area = cv2.cvtColor(processed_area, cv2.COLOR_BGR2GRAY)
+        # PENYESUAIAN GAUSSIAN BLUR: Kurangi kernel untuk mempertahankan detail karakter kecil pada plat.
+        # (3,3) adalah kompromi yang baik antara pengurangan noise dan detail.
+        processed_area_blurred = cv2.GaussianBlur(processed_area_clahe, (3, 3), 0) # DISESUAIKAN: kernel dari (5,5) ke (3,3)
 
-        # Peningkatan Kontras dengan CLAHE: Berguna untuk plat nomor dengan pencahayaan tidak merata,
-        # meningkatkan kontras lokal antara karakter dan latar belakang.
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        processed_area = clahe.apply(processed_area)
-
-        # Pengurangan Derau (Noise Reduction) dengan Gaussian Blur: Sangat direkomendasikan
-        # untuk menghaluskan gambar dan menghilangkan derau yang mengganggu karakter.
-        processed_area = cv2.GaussianBlur(processed_area, (5, 5), 0)
-
-        # Task 4.3: Thresholding (Mengubah gambar menjadi biner)
-        # Baik untuk memisahkan karakter dari latar belakang plat nomor secara adaptif
-        # terhadap variasi pencahayaan.
-        # --- PENTING: Eksperimen dengan parameter block_size (11) dan C (2) ---
-        # Jika gambar output debug_plate_images terlihat "putih semua" atau "hitam semua",
-        # atau sangat terdistorsi, ubah nilai-nilai ini.
-        # Contoh: cv2.adaptiveThreshold(processed_area, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5)
-        # --- DEBUGGING: Coba komentari baris ini jika gambar debug_plate_images masih terlalu terdistorsi setelah blur/CLAHE ---
-        processed_area = cv2.adaptiveThreshold(processed_area, 255, 
-                                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                               cv2.THRESH_BINARY, 11, 2)
+        # PENYESUAIAN KRITIS UNTUK ADAPTIVE THRESHOLDING
+        # Diganti ke ADAPTIVE_THRESH_MEAN_C karena lebih robust untuk variasi pencahayaan ekstrem (glare/bayangan).
+        # blockSize (15) menentukan area di sekitar piksel untuk menghitung ambang batas lokal. Harus ganjil.
+        # C (5) adalah konstanta yang dikurangkan dari rata-rata. Nilai positif membantu memisahkan teks terang dari latar belakang bervariasi.
+        processed_area_thresholded = cv2.adaptiveThreshold(processed_area_blurred, 255, 
+                                                           cv2.ADAPTIVE_THRESH_MEAN_C, # DISESUAIKAN: dari GAUSSIAN_C ke MEAN_C
+                                                           cv2.THRESH_BINARY_INV, # THRESH_BINARY_INV: teks putih di latar belakang hitam
+                                                           15, # DISESUAIKAN: blockSize dari 11 ke 15
+                                                           5)  # DISESUAIKAN: C dari -1 ke 5
         
-        # Operasi Morfologi (Erosi/Dilasi):
-        # Erosi dapat menghilangkan noise kecil, Dilasi dapat menyatukan bagian karakter yang terpisah.
-        # Hati-hati, bisa merusak karakter jika terlalu agresif. Coba nonaktifkan jika ada masalah.
-        kernel = np.ones((3,3),np.uint8) # Kernel kecil
-        # --- DEBUGGING: Coba komentari baris erode/dilate ini jika gambar debug_plate_images terlalu terdistorsi ---
-        # processed_area = cv2.erode(processed_area, kernel, iterations = 1)
-        # processed_area = cv2.dilate(processed_area, kernel, iterations = 1)
+        # Operasi Morfologi (Erosi/Dilasi): Digunakan untuk membersihkan noise kecil atau menyatukan fragmen karakter.
+        # Kernel (2,2) lebih halus dan cocok untuk karakter yang lebih kecil.
+        kernel = np.ones((2,2),np.uint8) # DISESUAIKAN: kernel dari (3,3) ke (2,2)
+        processed_area_morphed = cv2.erode(processed_area_thresholded, kernel, iterations = 1)
+        processed_area_morphed = cv2.dilate(processed_area_morphed, kernel, iterations = 1)
 
-        # Task 4.4: Segmentasi Karakter (Implisit oleh EasyOCR)
-        # EasyOCR secara internal melakukan segmentasi karakter setelah mendeteksi area teks.
-        # Jika Anda ingin segmentasi karakter eksplisit (misalnya untuk visualisasi atau OCR kustom),
-        # Anda bisa menggunakan cv2.findContours pada 'processed_area' biner, lalu memfilter kontur
-        # berdasarkan rasio aspek, ukuran, dan area untuk mengidentifikasi setiap karakter.
-        # Namun, untuk alur dengan EasyOCR, ini tidak diperlukan secara langsung.
+        # Melakukan OCR pada gambar plat nomor yang sudah diproses.
+        results = reader.readtext(processed_area_morphed, detail=1)
 
-        # --- DEBUGGING: Simpan gambar plat nomor yang diproses sebelum OCR ---
-        # Ini akan membantu Anda melihat kualitas gambar yang diberikan ke EasyOCR.
-        # Simpan gambar ini SETELAH SEMUA pra-pemrosesan di atas.
-        timestamp_debug = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        debug_plate_filename = os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_plate_{timestamp_debug}.jpg")
-        cv2.imwrite(debug_plate_filename, processed_area)
-        print(f"[DEBUG] Gambar plat nomor diproses untuk debug disimpan: {debug_plate_filename}")
-        # --- Akhir DEBUGGING ---
-
-        # --- Task 5: Pengenalan Karakter Optik (OCR) ---
-        # Metode Deteksi: Jaringan Saraf Tiruan (CNN) - EasyOCR
-        # EasyOCR menggunakan model deep learning untuk mendeteksi area teks (plat nomor)
-        # dan mengenali karakternya.
-        results = reader.readtext(processed_area, detail=1)
+        # DEBUGGING: Simpan semua gambar pra-pemrosesan jika EasyOCR mendeteksi teks (bahkan teks sampah).
+        # Ini sangat penting untuk melihat apakah tuning pra-pemrosesan berhasil membuat teks terbaca visual.
+        if results: 
+            timestamp_debug = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_original_{timestamp_debug}.jpg"), processed_area_original)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_deskewed_{timestamp_debug}.jpg"), processed_area_deskewed)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_grayscale_{timestamp_debug}.jpg"), processed_area_grayscale)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_clahe_{timestamp_debug}.jpg"), processed_area_clahe)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_blurred_{timestamp_debug}.jpg"), processed_area_blurred)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_thresholded_{timestamp_debug}.jpg"), processed_area_thresholded)
+            cv2.imwrite(os.path.join(DEBUG_PLATE_IMAGES_DIR, f"debug_morphed_{timestamp_debug}.jpg"), processed_area_morphed) 
+            print(f"[DEBUG] Gambar plat nomor diproses untuk debug disimpan (detected text): {os.path.join(DEBUG_PLATE_IMAGES_DIR, f'debug_morphed_{timestamp_debug}.jpg')}")
 
         for (bbox, text, prob) in results:
-            # Bersihkan teks: hanya ambil alfanumerik dan ubah ke huruf kapital
+            # Membersihkan teks: hanya karakter alfanumerik, lalu diubah ke huruf besar.
             cleaned_text = "".join(filter(str.isalnum, text)).upper()
-
-            # OPTIMASI 5: Koreksi Kesalahan Umum OCR
+            
+            # Terapkan koreksi kesalahan OCR (misal O->0, I->1).
             for original, corrected in OCR_CORRECTION_MAP.items():
                 cleaned_text = cleaned_text.replace(original, corrected)
 
-            # Task 6.1: Pemeriksaan Aturan (Validasi Format Plat Nomor)
-            # Filter results based on length and probability.
-            # Indonesian license plates generally have 4-10 alphanumeric characters.
-            # --- PENTING DEBUGGING: Ambang batas probabilitas dan filter Regex ---
-            # Jika CSV dan folder plate masih kosong, coba langkah-langkah ini:
-            # 1. Turunkan 'prob > 0.5' menjadi 'prob > 0.1' (atau lebih rendah) untuk melihat semua deteksi teks.
-            # 2. Jika masih kosong, coba komentari baris 'if re.match(INDONESIAN_PLATE_REGEX, cleaned_text):'
-            #    untuk melihat apakah EasyOCR mendeteksi teks tetapi formatnya tidak cocok.
-            # 3. Jika setelah itu CSV terisi dengan teks yang aneh, berarti pra-pemrosesan atau EasyOCR
-            #    sendiri yang bermasalah dalam mengenali karakter dengan benar.
-
-            if re.match(INDONESIAN_PLATE_REGEX, cleaned_text) and prob > 0.1: # DEBUGGING: Ambang batas probabilitas diturunkan
-            # if prob > 0.1: # DEBUGGING: Gunakan ini untuk melihat SEMUA deteksi teks tanpa validasi regex
-                
-                # Transform bounding box coordinates from area_img to original frame
+            is_valid_format = False
+            if ENABLE_PLATE_REGEX_VALIDATION:
+                # Coba cocokkan dengan regex ketat terlebih dahulu, lalu yang fleksibel.
+                if re.match(INDONESIAN_PLATE_REGEX, cleaned_text):
+                    is_valid_format = True
+                elif re.match(INDONESIAN_PLATE_REGEX_FLEXIBLE, cleaned_text):
+                    is_valid_format = True
+            else: # Jika validasi regex dinonaktifkan, semua format dianggap valid.
+                is_valid_format = True 
+            
+            # Ambang batas kepercayaan EasyOCR.
+            # Diturunkan menjadi 0.05 untuk debugging awal agar melihat lebih banyak deteksi (termasuk yang kurang yakin).
+            # Setelah pra-pemrosesan stabil, naikkan nilai ini (misal 0.5 atau 0.7) untuk mengurangi false positives.
+            if is_valid_format and prob > 0.05: # DISESUAIKAN: prob dari 0.5 ke 0.05 untuk debugging awal
                 (top_left, _, bottom_right, _) = bbox
-                x_plate = int(top_left[0]) + offset_x
-                y_plate = int(top_left[1]) + offset_y
+                x_plate_relative_to_vehicle = int(top_left[0])
+                y_plate_relative_to_vehicle = int(top_left[1])
                 w_plate = int(bottom_right[0] - top_left[0])
                 h_plate = int(bottom_right[1] - top_left[1])
 
-                detected_plates_info.append({
-                    'plate_box': (x_plate, y_plate, w_plate, h_plate),
+                # Transformasi koordinat plat nomor ke koordinat frame asli.
+                x_plate_on_full_frame = vehicle_offset_x + plate_search_x_relative + x_plate_relative_to_vehicle
+                y_plate_on_full_frame = vehicle_offset_y + plate_search_y_relative + y_plate_relative_to_vehicle
+
+                detected_plates_info_list.append({
+                    'plate_box': (x_plate_on_full_frame, y_plate_on_full_frame, w_plate, h_plate),
                     'text': cleaned_text,
                     'confidence': prob,
-                    'processed_plate_image': processed_area # Tambahkan gambar plat yang diproses
+                    'processed_plate_image': processed_area_morphed, 
+                    'cropped_vehicle_info': vehicle_info # Menyimpan info kendaraan terkait
                 })
-    return detected_plates_info
+    return detected_plates_info_list
 
-# --- Task 6: Validasi dan Format Keluaran - Fungsi Pembantu ---
-
+# --- Validasi dan Format Keluaran - Fungsi Pembantu ---
 def log_plate_detection(plate_text, status):
-    """
-    Task 6.3: Penyimpanan/Tampilan - Simpan ke log.
-    Mencatat deteksi plat nomor ke file log.
-    """
+    """Mencatat deteksi plat nomor ke file log tekstual dan konsol."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] Plat: {plate_text}, Status: {status}\n"
     with open(LOG_FILE_PATH, "a") as f:
         f.write(log_entry)
-    print(f"[LOG] {log_entry.strip()}") # Juga cetak ke konsol
+    print(f"[LOG] {log_entry.strip()}")
 
 def write_to_csv(timestamp, plate_text, status, confidence, full_frame_path=None, cropped_vehicle_path=None, processed_plate_path=None):
-    """
-    Menulis data deteksi plat nomor ke file CSV.
-    Menyertakan path gambar terkait.
-    """
+    """Menulis data deteksi plat nomor ke file CSV."""
     with open(CSV_LOG_FILE_PATH, mode='a', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([timestamp, plate_text, status, confidence, full_frame_path, cropped_vehicle_path, processed_plate_path])
 
 def check_database(plate_text):
-    """
-    Task 6.2: Basis Data - Bandingkan hasil dengan database plat nomor.
-    Simulasi pengecekan database. Dalam aplikasi nyata, ini akan query database.
-    """
+    """Simulasi pengecekan database plat nomor terdaftar."""
     return plate_text in REGISTERED_PLATES
 
-# --- OPTIMASI 7: Arsitektur Multi-threading ---
-
-# Queue untuk frame mentah dari pembaca video
+# --- Arsitektur Multi-threading (OPTIMASI 7) ---
+# Queue untuk frame mentah dari pembaca video.
 raw_frame_queue = queue.Queue(maxsize=5)
-# Queue untuk frame yang sudah diproses (dengan deteksi dan plat nomor)
+# Queue untuk frame yang sudah diproses.
 processed_frame_queue = queue.Queue(maxsize=5)
-# Event untuk sinyal berhenti ke thread
+# Event untuk sinyal berhenti ke thread lain.
 stop_event = threading.Event()
 
 class FrameReader(threading.Thread):
-    """
-    Thread untuk membaca frame dari sumber video dan memasukkannya ke dalam queue.
-    """
-    def __init__(self, video_path, queue, stop_event):
+    """Thread untuk membaca frame dari sumber video."""
+    def __init__(self, video_path, q, stop_e):
         super().__init__()
         self.video_path = video_path
-        self.queue = queue
-        self.stop_event = stop_event
+        self.queue = q
+        self.stop_event = stop_e
         self.vs = None
-        self.daemon = True # Set thread sebagai daemon agar berhenti saat program utama berhenti
+        self.daemon = True 
 
     def run(self):
         print("[INFO] Thread FrameReader dimulai...")
         self.vs = cv2.VideoCapture(self.video_path)
         if not self.vs.isOpened():
             print(f"[ERROR] FrameReader: Tidak dapat membuka file video: {self.video_path}")
-            self.stop_event.set() # Set event untuk menghentikan thread lain
+            self.stop_event.set() 
             return
 
         while not self.stop_event.is_set():
             ret, frame = self.vs.read()
             if not ret:
                 print("[INFO] FrameReader: Akhir stream video atau masalah membaca frame.")
-                self.stop_event.set() # Set event untuk menghentikan thread lain
+                self.stop_event.set() 
                 break
             
-            # Coba masukkan frame ke queue, jika penuh, lewati (untuk menjaga real-time)
-            try:
+            try: # Coba masukkan frame ke queue. Jika penuh, lewati.
                 self.queue.put(frame, block=False)
             except queue.Full:
-                pass # Queue penuh, lewati frame ini
+                pass 
 
-        self.vs.release()
+        self.vs.release() 
         print("[INFO] Thread FrameReader dihentikan.")
 
 class FrameProcessor(threading.Thread):
-    """
-    Thread untuk mengambil frame dari raw_frame_queue, memprosesnya (deteksi YOLO & OCR),
-    dan memasukkan frame yang sudah diproses ke processed_frame_queue.
-    Juga bertanggung jawab untuk menyimpan gambar berdasarkan deteksi.
-    """
-    def __init__(self, raw_queue, processed_queue, stop_event, yolo_model, easyocr_reader):
+    """Thread untuk memproses frame (deteksi YOLO & OCR) dan mengelola output."""
+    def __init__(self, raw_q, processed_q, stop_e, yolo_m, easyocr_r):
         super().__init__()
-        self.raw_queue = raw_queue
-        self.processed_queue = processed_queue
-        self.stop_event = stop_event
-        self.yolo_model = yolo_model
-        self.easyocr_reader = easyocr_reader
-        self.daemon = True # Set thread sebagai daemon
+        self.raw_queue = raw_q
+        self.processed_queue = processed_q
+        self.stop_event = stop_e
+        self.yolo_model = yolo_m
+        self.easyocr_reader = easyocr_r
+        self.daemon = True 
 
     def run(self):
         print("[INFO] Thread FrameProcessor dimulai...")
         while not self.stop_event.is_set() or not self.raw_queue.empty():
             try:
-                frame = self.raw_queue.get(timeout=1) # Tunggu frame hingga 1 detik
+                frame = self.raw_queue.get(timeout=1) 
             except queue.Empty:
                 if self.stop_event.is_set():
-                    break # Keluar jika sudah disinyal berhenti dan queue kosong
+                    break 
                 continue
 
-            # --- Main Video Pre-processing (Optimalisasi 1: Normalisasi Ukuran Frame) ---
-            # Mengurangi resolusi frame sebelum deteksi untuk mengurangi beban komputasi.
-            # Sesuaikan 'new_width' sesuai kebutuhan performa dan kualitas Anda.
-            new_width = 960 # Contoh: Resize ke lebar 960px (dari default 640px YOLOv8)
+            # Normalisasi ukuran frame untuk pemrosesan yang konsisten.
+            new_width = 960 
             new_height = int(frame.shape[0] * (new_width / frame.shape[1]))
             frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
-            # Example: Noise Reduction on the entire frame (opsional)
-            # frame = cv2.GaussianBlur(frame, (3, 3), 0) # Smaller kernel for object detection
+            # Deteksi kendaraan.
+            detected_vehicles = detect_vehicles(frame, self.yolo_model, confidence_threshold=0.5) 
 
-            # Grayscale Conversion (NOT recommended for YOLOv8 input, as it's trained with RGB)
-            # gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # frame_for_yolo = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR) # Convert back to 3 channels if YOLO needs it
-
-            # --- End of Main Video Pre-processing ---
-
-            # Deteksi kendaraan menggunakan YOLOv8.
-            # Ambang batas kepercayaan dinaikkan sedikit untuk mengurangi false positive.
-            detected_vehicles = detect_vehicles(frame, self.yolo_model, confidence_threshold=0.6) # Ambang batas dinaikkan
-
-            # Deteksi dan kenali plat nomor
-            detected_plates = detect_and_recognize_license_plates(frame, detected_vehicles, self.easyocr_reader)
-
-            # Task 6: Validasi dan Format Keluaran - Implementasi di Processor Thread
-            # Serta Penyimpanan Gambar Per Deteksi
+            # Deteksi dan kenali plat nomor.
+            detected_plates_from_vehicles = detect_and_recognize_license_plates(frame, detected_vehicles, self.easyocr_reader)
             
-            # Inisialisasi timestamp_str di sini, agar selalu tersedia jika ada deteksi
             timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            any_detection_in_frame = False
+            any_detection_in_frame = False 
             
-            # Path untuk gambar yang akan disimpan (inisialisasi dengan None)
-            full_frame_path = None
-            cropped_vehicle_path = None
-            processed_plate_path = None
+            current_full_frame_path = None 
+            plates_data_for_csv = [] 
 
-
-            for plate_info in detected_plates:
+            for plate_info in detected_plates_from_vehicles:
                 plate_text = plate_info['text']
+                plate_conf = plate_info['confidence'] 
                 
-                # Task 6.2: Basis Data - Bandingkan hasil dengan database plat nomor.
                 is_registered = check_database(plate_text)
                 status = "TERDAFTAR" if is_registered else "TIDAK TERDAFTAR"
                 
-                # Task 6.3: Penyimpanan/Tampilan - Simpan ke log.
                 log_plate_detection(plate_text, status)
-                any_detection_in_frame = True
+                any_detection_in_frame = True 
 
-                # Visualisasi hasil (tetap di sini agar data log sinkron dengan tampilan)
                 (x_plate, y_plate, w_plate, h_plate) = plate_info['plate_box']
-                plate_conf = float(plate_info['confidence']) # Pastikan confidence adalah float
-                
-                # Ubah warna bounding box dan teks berdasarkan status registrasi
-                color = (0, 255, 0) if is_registered else (0, 0, 255) # Hijau jika terdaftar, Merah jika tidak
+                color = (0, 255, 0) if is_registered else (0, 0, 255) 
                 cv2.rectangle(frame, (x_plate, y_plate), (x_plate + w_plate, y_plate + h_plate), color, 2)
                 cv2.putText(frame, f"Plat: {plate_text} ({status})",
-                            (x_plate, y_plate - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                                    (x_plate, y_plate - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.putText(frame, f"Conf: {plate_conf:.2f}",
-                            (x_plate, y_plate - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                                    (x_plate, y_plate - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-                # --- Penyimpanan Gambar Plat Nomor yang Diproses ---
+                current_processed_plate_path = ""
                 if 'processed_plate_image' in plate_info and plate_info['processed_plate_image'] is not None:
-                    processed_plate_path = os.path.join(PROCESSED_LICENSE_PLATE_IMAGES_DIR, f"plate_{plate_text}_{timestamp_str}.jpg")
-                    cv2.imwrite(processed_plate_path, plate_info['processed_plate_image'])
-                    print(f"[INFO] Gambar plat nomor diproses disimpan: {processed_plate_path}")
+                    current_processed_plate_path = os.path.join(PROCESSED_LICENSE_PLATE_IMAGES_DIR, f"plate_{plate_text}_{timestamp_str}.jpg")
+                    cv2.imwrite(current_processed_plate_path, plate_info['processed_plate_image'])
+                    print(f"[INFO] Gambar plat nomor diproses disimpan: {current_processed_plate_path}")
+                
+                plates_data_for_csv.append({
+                    'plate_text': plate_text,
+                    'status': status,
+                    'confidence': plate_conf,
+                    'processed_plate_path': current_processed_plate_path,
+                    'cropped_vehicle_path': plate_info['cropped_vehicle_info'].get('cropped_image_path', '') 
+                })
 
-
-            # Visualisasi kendaraan (tetap di sini)
-            for vehicle in detected_vehicles:
+            # Visualisasi bounding box kendaraan
+            for vehicle_idx, vehicle in enumerate(detected_vehicles):
                 (x, y, w, h) = vehicle['box']
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 text = f"{vehicle['label']}: {vehicle['confidence']:.2f}"
                 cv2.putText(frame, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                any_detection_in_frame = True # Set true jika ada deteksi kendaraan
+                any_detection_in_frame = True 
 
-                # --- Penyimpanan Gambar Kendaraan yang Di-crop ---
-                if 'cropped_image' in vehicle and vehicle['cropped_image'] is not None:
-                    cropped_vehicle_path = os.path.join(CROPPED_VEHICLE_IMAGES_DIR, f"vehicle_{vehicle['label']}_{timestamp_str}.jpg")
-                    cv2.imwrite(cropped_vehicle_path, vehicle['cropped_image'])
-                    print(f"[INFO] Gambar kendaraan di-crop disimpan: {cropped_vehicle_path}")
-
-
-            # --- Penyimpanan Gambar Frame Lengkap Jika Ada Deteksi ---
+            # Simpan frame lengkap jika ada deteksi kendaraan atau plat nomor.
             if any_detection_in_frame:
-                full_frame_path = os.path.join(FULL_FRAMES_WITH_DETECTIONS_DIR, f"frame_with_detections_{timestamp_str}.jpg")
-                cv2.imwrite(full_frame_path, frame) # Simpan frame dengan semua kotak dan teks
-                print(f"[INFO] Gambar frame dengan deteksi disimpan: {full_frame_path}")
+                current_full_frame_path = os.path.join(FULL_FRAMES_WITH_DETECTIONS_DIR, f"frame_with_detections_{timestamp_str}.jpg")
+                cv2.imwrite(current_full_frame_path, frame) 
+                print(f"[INFO] Gambar frame dengan deteksi disimpan: {current_full_frame_path}")
 
-            # --- Menulis ke CSV (setelah semua path gambar diketahui) ---
-            # Hanya tulis ke CSV jika ada deteksi plat nomor
-            if detected_plates:
-                # Ambil data dari plat pertama yang terdeteksi untuk CSV
-                # Anda bisa memodifikasi ini untuk mencatat semua plat jika ada banyak
-                first_plate_info = detected_plates[0]
-                write_to_csv(timestamp_str, first_plate_info['text'], 
-                             ("TERDAFTAR" if check_database(first_plate_info['text']) else "TIDAK TERDAFTAR"),
-                             first_plate_info['confidence'],
-                             full_frame_path, cropped_vehicle_path, processed_plate_path)
-
-
-            # Coba masukkan frame yang sudah diproses ke queue, jika penuh, lewati
+            # Tulis setiap deteksi plat nomor ke CSV.
+            for plate_data in plates_data_for_csv:
+                write_to_csv(timestamp_str, plate_data['plate_text'], 
+                             plate_data['status'], plate_data['confidence'],
+                             current_full_frame_path, 
+                             plate_data['cropped_vehicle_path'], 
+                             plate_data['processed_plate_path'])
+                             
+            # Masukkan frame yang sudah diproses ke queue untuk ditampilkan.
             try:
                 self.processed_queue.put(frame, block=False)
             except queue.Full:
-                pass # Queue penuh, lewati frame ini
+                pass 
 
         print("[INFO] Thread FrameProcessor dihentikan.")
 
-
 # --- Real-time Main Loop (Display Thread) ---
-
 def main():
     print("[INFO] Memulai streaming video...")
     
-    # Video Source: Menggunakan file video MP4.
-    # Ganti "videos/Licence_Plate_Car.mp4" dengan jalur relatif atau absolut ke file video Anda.
-    # Pastikan menggunakan forward slashes (/) atau double backslashes (\\) untuk path di Windows.
-    video_path = "videos/Licence_Plate_Car.mp4" # <--- GANTI INI DENGAN JALUR FILE VIDEO ANDA
+    # --- GANTI INI DENGAN JALUR FILE VIDEO ANDA YANG BENAR ---
+    # Pilih salah satu video yang Anda unggah:
+    video_path = "videos/Licence_Plate_Car.mp4" 
+    # Untuk mencoba video kedua:
+    # video_path = "videos/License_Plate_2.mp4" 
 
-    # Inisialisasi dan mulai thread pembaca frame
+    # Inisialisasi dan mulai thread pembaca frame.
     reader_thread = FrameReader(video_path, raw_frame_queue, stop_event)
     reader_thread.start()
 
-    # Inisialisasi dan mulai thread pemroses frame
+    # Inisialisasi dan mulai thread pemroses frame.
     processor_thread = FrameProcessor(raw_frame_queue, processed_frame_queue, stop_event, yolo_model, reader)
     processor_thread.start()
 
     try:
+        # Loop utama untuk menampilkan frame yang sudah diproses.
         while not stop_event.is_set():
-            # Ambil frame yang sudah diproses dari queue
             try:
-                frame_to_display = processed_frame_queue.get(timeout=1) # Tunggu frame hingga 1 detik
+                frame_to_display = processed_frame_queue.get(timeout=1) 
             except queue.Empty:
                 if stop_event.is_set():
-                    break # Keluar jika sudah disinyal berhenti dan queue kosong
-                continue # Lanjutkan menunggu frame
+                    break 
+                continue
 
-            # Display frame
             cv2.imshow("Real-time ANPR (YOLOv8)", frame_to_display)
 
+            # Cek input keyboard. Tekan 'q' untuk keluar.
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
-                stop_event.set() # Set event untuk menghentikan semua thread
+                stop_event.set() 
                 break
 
     except Exception as e:
-        print(f"[ERROR] An error occurred in main display loop: {e}")
+        print(f"[ERROR] Terjadi kesalahan pada loop tampilan utama: {e}")
     finally:
-        print("[INFO] Menghentikan streaming video dan membersihkan...")
-        stop_event.set() # Pastikan event berhenti diset jika ada error atau keluar
-        reader_thread.join() # Tunggu thread reader selesai
-        processor_thread.join() # Tunggu thread processor selesai
-        cv2.destroyAllWindows()
+        print("[INFO] Menghentikan streaming video dan membersihkan sumber daya...")
+        stop_event.set() 
+        reader_thread.join() 
+        processor_thread.join() 
+        cv2.destroyAllWindows() 
         print("[INFO] Program selesai.")
 
 if __name__ == "__main__":
-    # OPTIMASI 2: Optimasi Model (Inferensi)
-    # Setelah model YOLOv8 dilatih atau diunduh, Anda bisa mengoptimalkannya untuk inferensi lebih cepat:
-    # - Konversi ke format ONNX atau OpenVINO: Ultralytics mendukung ekspor model ke format ini.
-    # - NVIDIA TensorRT: Untuk GPU NVIDIA, konversi model ke format TensorRT dapat memberikan
-    #   peningkatan kecepatan inferensi yang signifikan. Ini adalah framework optimasi inferensi.
-
-    # OPTIMASI 6: Sistem Pelacakan Objek (Object Tracking)
-    # Implementasi pelacakan objek (misalnya DeepSORT, ByteTrack) akan sangat meningkatkan konsistensi
-    # deteksi dan pengenalan plat nomor di seluruh frame. Ini memungkinkan:
-    # - Pemberian ID unik untuk setiap kendaraan/plat nomor yang dilacak.
-    # - Pengumpulan hasil OCR dari beberapa frame untuk satu plat nomor, lalu memilih hasil terbaik
-    #   (misalnya, yang paling sering muncul atau dengan confidence tertinggi).
-    # - Mengurangi beban komputasi karena deteksi penuh tidak perlu dilakukan di setiap frame
-    #   untuk objek yang sudah dilacak.
-    # Implementasi ini membutuhkan pustaka tambahan dan logika yang kompleks, sehingga tidak disertakan
-    # langsung dalam kode ini, namun sangat direkomendasikan untuk sistem produksi.
-
-    # OPTIMASI 8: Pelatihan Model YOLO Kustom untuk Plat Nomor
-    # Untuk akurasi deteksi lokasi plat nomor yang lebih tinggi, Anda dapat melatih
-    # model YOLOv8 kedua (lebih kecil) khusus untuk mendeteksi plat nomor.
-    # Alurnya akan menjadi:
-    # 1. YOLOv8 umum (deteksi kendaraan) -> menghasilkan bounding box kendaraan.
-    # 2. YOLOv8 kustom (deteksi plat nomor) -> mencari plat nomor di dalam bounding box kendaraan.
-    # 3. EasyOCR (atau OCR kustom) -> mengenali teks dari plat nomor yang terpotong.
-    # Ini membutuhkan dataset plat nomor yang diberi anotasi dan proses pelatihan yang signifikan.
-
-    # OPTIMASI 9 (Tambahan): Database Plat Nomor
-    # Jika Anda memiliki daftar plat nomor yang terdaftar, Anda dapat mengintegrasikan
-    # hasil OCR dengan database tersebut untuk verifikasi, pencatatan waktu, atau tujuan lainnya.
-    # Ini membutuhkan koneksi ke database (misalnya SQLite, PostgreSQL, MySQL) dan logika query.
-
     main()
